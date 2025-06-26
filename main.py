@@ -1,0 +1,462 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import os
+
+# Global pose detector instance for faster loading
+_pose_detector = None
+
+def get_pose_detector():
+    global _pose_detector
+    if _pose_detector is None:
+        mp_pose = mp.solutions.pose
+        _pose_detector = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,  # Reduced complexity for better performance
+            enable_segmentation=False,
+            min_detection_confidence=0.5,  # Lower threshold for better detection
+            min_tracking_confidence=0.5
+        )
+    return _pose_detector
+
+class ImprovedSquatAnalyzer:
+    def __init__(self):
+        # Initialize MediaPipe pose detection with singleton pattern
+        self.mp_pose = mp.solutions.pose
+        self.pose = get_pose_detector()
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Store previous landmarks for smoothing
+        self.prev_landmarks = None
+        self.landmark_history = []
+        self.max_history = 3  # Reduced history for less lag
+        
+        # Frame counter for debugging
+        self.frame_count = 0
+        self.detection_count = 0
+
+    def smooth_landmarks(self, landmarks):
+        """Apply gentle temporal smoothing to reduce jitter"""
+        if not landmarks:
+            return None
+            
+        # Add current landmarks to history
+        self.landmark_history.append(landmarks)
+        if len(self.landmark_history) > self.max_history:
+            self.landmark_history.pop(0)
+        
+        # If we don't have enough history, return current
+        if len(self.landmark_history) < 2:
+            return landmarks
+        
+        # Light smoothing - weight current frame more heavily
+        if len(self.landmark_history) == 2:
+            # 70% current, 30% previous
+            prev_landmarks = self.landmark_history[0]
+            curr_landmarks = self.landmark_history[1]
+            
+            for i in range(len(landmarks.landmark)):
+                curr_landmarks.landmark[i].x = (0.7 * curr_landmarks.landmark[i].x + 
+                                               0.3 * prev_landmarks.landmark[i].x)
+                curr_landmarks.landmark[i].y = (0.7 * curr_landmarks.landmark[i].y + 
+                                               0.3 * prev_landmarks.landmark[i].y)
+        
+        return landmarks
+
+    def filter_reliable_landmarks(self, landmarks, threshold=0.3):
+        """Only use landmarks with reasonable confidence - lowered threshold"""
+        reliable_indices = []
+        for i, landmark in enumerate(landmarks.landmark):
+            if landmark.visibility > threshold:
+                reliable_indices.append(i)
+        return reliable_indices
+
+    def draw_clean_stick_figure(self, image, landmarks):
+        """Draw a cleaner stick figure focusing on reliable points"""
+        if not landmarks:
+            return image
+        
+        h, w, _ = image.shape
+        min_visibility = 0.3  # Much lower threshold
+        
+        # Get key landmarks
+        left_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_HIP]
+        left_knee = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_KNEE]
+        right_knee = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_KNEE]
+        left_ankle = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_ANKLE]
+        
+        # Draw torso if shoulders and hips are visible
+        if (left_shoulder.visibility > min_visibility and right_shoulder.visibility > min_visibility and
+            left_hip.visibility > min_visibility and right_hip.visibility > min_visibility):
+            
+            # Calculate center points
+            shoulder_center_x = int((left_shoulder.x + right_shoulder.x) * w / 2)
+            shoulder_center_y = int((left_shoulder.y + right_shoulder.y) * h / 2)
+            hip_center_x = int((left_hip.x + right_hip.x) * w / 2)
+            hip_center_y = int((left_hip.y + right_hip.y) * h / 2)
+            
+            # Draw spine
+            cv2.line(image, (shoulder_center_x, shoulder_center_y), 
+                    (hip_center_x, hip_center_y), (0, 255, 255), 3)  # Yellow spine
+            
+            # Draw shoulder line
+            cv2.line(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)),
+                    (int(right_shoulder.x * w), int(right_shoulder.y * h)), (255, 0, 0), 2)
+            
+            # Draw hip line
+            cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)),
+                    (int(right_hip.x * w), int(right_hip.y * h)), (255, 0, 0), 2)
+        
+        # Draw legs - prioritize these for squat analysis
+        leg_connections = [
+            (self.mp_pose.PoseLandmark.LEFT_HIP, self.mp_pose.PoseLandmark.LEFT_KNEE, "Left Thigh"),
+            (self.mp_pose.PoseLandmark.LEFT_KNEE, self.mp_pose.PoseLandmark.LEFT_ANKLE, "Left Shin"),
+            (self.mp_pose.PoseLandmark.RIGHT_HIP, self.mp_pose.PoseLandmark.RIGHT_KNEE, "Right Thigh"),
+            (self.mp_pose.PoseLandmark.RIGHT_KNEE, self.mp_pose.PoseLandmark.RIGHT_ANKLE, "Right Shin"),
+        ]
+        
+        for start_idx, end_idx, name in leg_connections:
+            start_landmark = landmarks.landmark[start_idx]
+            end_landmark = landmarks.landmark[end_idx]
+            
+            if start_landmark.visibility > min_visibility and end_landmark.visibility > min_visibility:
+                start_coords = (int(start_landmark.x * w), int(start_landmark.y * h))
+                end_coords = (int(end_landmark.x * w), int(end_landmark.y * h))
+                cv2.line(image, start_coords, end_coords, (0, 255, 0), 3)
+        
+        # Draw joint points with different colors based on confidence
+        key_points = [
+            (self.mp_pose.PoseLandmark.LEFT_SHOULDER, "L_Shoulder"),
+            (self.mp_pose.PoseLandmark.RIGHT_SHOULDER, "R_Shoulder"),
+            (self.mp_pose.PoseLandmark.LEFT_HIP, "L_Hip"),
+            (self.mp_pose.PoseLandmark.RIGHT_HIP, "R_Hip"),
+            (self.mp_pose.PoseLandmark.LEFT_KNEE, "L_Knee"),
+            (self.mp_pose.PoseLandmark.RIGHT_KNEE, "R_Knee"),
+            (self.mp_pose.PoseLandmark.LEFT_ANKLE, "L_Ankle"),
+            (self.mp_pose.PoseLandmark.RIGHT_ANKLE, "R_Ankle"),
+        ]
+        
+        for point_idx, name in key_points:
+            landmark = landmarks.landmark[point_idx]
+            if landmark.visibility > min_visibility:
+                x = int(landmark.x * w)
+                y = int(landmark.y * h)
+                
+                # Color based on confidence
+                if landmark.visibility > 0.7:
+                    color = (0, 0, 255)  # Red - high confidence
+                elif landmark.visibility > 0.5:
+                    color = (0, 165, 255)  # Orange - medium confidence
+                else:
+                    color = (0, 255, 255)  # Yellow - low confidence
+                
+                cv2.circle(image, (x, y), 5, color, -1)
+                
+                # Add debug text for key leg points
+                if 'Knee' in name or 'Hip' in name or 'Ankle' in name:
+                    cv2.putText(image, f'{landmark.visibility:.2f}', 
+                               (x + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        return image
+
+    def calculate_angle(self, p1, p2, p3):
+        """Calculate angle between three points"""
+        try:
+            a = np.array([p1[0] - p2[0], p1[1] - p2[1]])
+            b = np.array([p3[0] - p2[0], p3[1] - p2[1]])
+            
+            cosine_angle = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+            angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+            return np.degrees(angle)
+        except:
+            return 0
+
+    def analyze_squat_form(self, landmarks):
+        """Comprehensive squat form analysis with lower thresholds"""
+        if not landmarks:
+            return {}
+        
+        min_visibility = 0.3  # Lower threshold
+        
+        # Get key landmarks
+        left_hip = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_HIP]
+        left_knee = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_KNEE]
+        right_knee = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_KNEE]
+        left_ankle = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_ANKLE]
+        
+        analysis = {}
+        
+        # Check if we have enough landmarks for analysis
+        required_landmarks = [left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]
+        visible_count = sum(1 for lm in required_landmarks if lm.visibility > min_visibility)
+        
+        analysis['visible_landmarks'] = visible_count
+        analysis['detection_quality'] = 'Good' if visible_count >= 5 else 'Poor' if visible_count < 3 else 'Fair'
+        
+        if visible_count < 4:
+            analysis['form_issues'] = ['Insufficient landmark detection']
+            return analysis
+        
+        # 1. Squat Depth (if hips, knees, ankles are visible)
+        if (left_hip.visibility > min_visibility and right_hip.visibility > min_visibility and
+            left_knee.visibility > min_visibility and right_knee.visibility > min_visibility and
+            left_ankle.visibility > min_visibility and right_ankle.visibility > min_visibility):
+            
+            hip_y = (left_hip.y + right_hip.y) / 2
+            knee_y = (left_knee.y + right_knee.y) / 2
+            ankle_y = (left_ankle.y + right_ankle.y) / 2
+            
+            # Calculate depth based on hip-knee relationship
+            if hip_y < knee_y:  # Hips above knees (standing position)
+                squat_depth = 0
+            else:
+                # Calculate actual squat depth
+                hip_knee_diff = hip_y - knee_y  # How much hips dropped below knees
+                
+                # Use a more reliable reference for depth calculation
+                # Calculate the distance from hip to ankle as leg length
+                avg_hip_y = (left_hip.y + right_hip.y) / 2
+                avg_ankle_y = (left_ankle.y + right_ankle.y) / 2
+                leg_length = avg_ankle_y - avg_hip_y
+                
+                if leg_length > 0:
+                    # Normalize the depth as a percentage of leg length
+                    depth_ratio = hip_knee_diff / leg_length
+                    squat_depth = min(100, max(0, depth_ratio * 200))  # Scale factor adjusted
+                else:
+                    squat_depth = 0
+
+            
+            analysis['squat_depth'] = squat_depth
+        
+        # 2. Knee Angles
+        knee_angles = []
+        if (left_hip.visibility > min_visibility and left_knee.visibility > min_visibility and 
+            left_ankle.visibility > min_visibility):
+            left_knee_angle = self.calculate_angle(
+                (left_hip.x, left_hip.y),
+                (left_knee.x, left_knee.y),
+                (left_ankle.x, left_ankle.y)
+            )
+            if left_knee_angle > 0:
+                knee_angles.append(left_knee_angle)
+        
+        if (right_hip.visibility > min_visibility and right_knee.visibility > min_visibility and 
+            right_ankle.visibility > min_visibility):
+            right_knee_angle = self.calculate_angle(
+                (right_hip.x, right_hip.y),
+                (right_knee.x, right_knee.y),
+                (right_ankle.x, right_ankle.y)
+            )
+            if right_knee_angle > 0:
+                knee_angles.append(right_knee_angle)
+        
+        if knee_angles:
+            analysis['knee_angle'] = sum(knee_angles) / len(knee_angles)
+        
+        # 3. Form Assessment
+        analysis['form_issues'] = []
+        
+        # Check squat depth
+        if 'squat_depth' in analysis:
+            depth = analysis['squat_depth']
+            if depth < 30:
+                analysis['form_issues'].append("Shallow squat - go deeper")
+            elif depth > 90:
+                analysis['form_issues'].append("Very deep squat")
+        
+        # Check knee angle
+        if 'knee_angle' in analysis:
+            angle = analysis['knee_angle']
+            if angle < 60:
+                analysis['form_issues'].append("Knees very bent")
+            elif angle > 170:
+                analysis['form_issues'].append("Knees not bent enough")
+        
+        return analysis
+
+    def draw_form_feedback(self, image, analysis):
+        """Draw form analysis on the image"""
+        h, w, _ = image.shape
+        y_offset = 30
+        
+        # Detection quality
+        quality = analysis.get('detection_quality', 'Unknown')
+        visible = analysis.get('visible_landmarks', 0)
+        color = (0, 255, 0) if quality == 'Good' else (0, 165, 255) if quality == 'Fair' else (0, 0, 255)
+        cv2.putText(image, f'Detection: {quality} ({visible}/6)', (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        y_offset += 30
+        
+        # Squat depth
+        if 'squat_depth' in analysis:
+            depth = analysis['squat_depth']
+            color = (0, 255, 0) if 40 <= depth <= 80 else (0, 255, 255)
+            cv2.putText(image, f'Depth: {depth:.1f}%', (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            y_offset += 30
+        
+        # Knee angle
+        if 'knee_angle' in analysis:
+            angle = analysis['knee_angle']
+            color = (0, 255, 0) if 90 <= angle <= 150 else (0, 255, 255)
+            cv2.putText(image, f'Knee Angle: {angle:.1f}°', (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            y_offset += 30
+        
+        # Form issues
+        if analysis.get('form_issues'):
+            cv2.putText(image, 'Issues:', (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            y_offset += 25
+            
+            for issue in analysis['form_issues'][:2]:  # Show max 2 issues
+                cv2.putText(image, f'• {issue}', (15, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                y_offset += 20
+        else:
+            if analysis.get('detection_quality') == 'Good':
+                cv2.putText(image, 'Form looks good!', (10, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Debug info
+        cv2.putText(image, f'Frame: {self.frame_count} | Detections: {self.detection_count}', 
+                   (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        return image
+    
+    def process_video(self, video_path, output_path=None):
+        """Process video with improved analysis"""
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            print(f"Error: Could not open video {video_path}")
+            return
+        
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # NEW: Debug video properties
+        print(f"=== VIDEO DEBUG INFO ===")
+        print(f"Reported dimensions: {width}x{height}")
+        print(f"Aspect ratio: {width/height:.2f}")
+        print(f"Is vertical: {height > width}")
+        
+        # Check if there's rotation metadata
+        rotation = cap.get(cv2.CAP_PROP_ORIENTATION_META)
+        print(f"Rotation metadata: {rotation}")
+        
+        # Read first frame to check actual dimensions
+        ret, first_frame = cap.read()
+        if ret:
+            actual_height, actual_width = first_frame.shape[:2]
+            print(f"Actual frame dimensions: {actual_width}x{actual_height}")
+            print(f"Dimensions match: {width == actual_width and height == actual_height}")
+            
+            # Reset video to beginning
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        print(f"========================")
+        
+        print(f"Video info: {width}x{height}, {fps} FPS, {total_frames} frames")
+        
+        # If you want to force the output to maintain the input orientation:
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Use the ACTUAL frame dimensions, not the reported ones
+            if 'actual_width' in locals() and 'actual_height' in locals():
+                out = cv2.VideoWriter(output_path, fourcc, fps, (actual_width, actual_height))
+            else:
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        self.frame_count = 0
+        self.detection_count = 0
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            self.frame_count += 1
+            
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.pose.process(rgb_frame)
+            
+            if results.pose_landmarks:
+                self.detection_count += 1
+                
+                # Apply light smoothing
+                smoothed_landmarks = self.smooth_landmarks(results.pose_landmarks)
+                
+                # Draw improved stick figure
+                frame = self.draw_clean_stick_figure(frame, smoothed_landmarks)
+                
+                # Analyze form
+                analysis = self.analyze_squat_form(smoothed_landmarks)
+                
+                # Draw feedback
+                frame = self.draw_form_feedback(frame, analysis)
+            else:
+                # No detection
+                cv2.putText(frame, 'No pose detected', (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                cv2.putText(frame, f'Frame: {self.frame_count} | Detections: {self.detection_count}', 
+                           (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            cv2.imshow('Improved Squat Analysis', frame)
+            
+            if out:
+                out.write(frame)
+            
+            # Progress indicator
+            if self.frame_count % 30 == 0:
+                progress = (self.frame_count / total_frames) * 100 if total_frames > 0 else 0
+                print(f"Progress: {progress:.1f}% - Detections: {self.detection_count}/{self.frame_count}")
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        cap.release()
+        if out:
+            out.release()
+        cv2.destroyAllWindows()
+        
+        print(f"\nProcessing complete!")
+        print(f"Total frames: {self.frame_count}")
+        print(f"Successful detections: {self.detection_count}")
+        print(f"Detection rate: {(self.detection_count/self.frame_count)*100:.1f}%")
+
+
+def main():
+    analyzer = ImprovedSquatAnalyzer()
+    
+    print("Improved MediaPipe Squat Analyzer")
+    print("This version uses lower confidence thresholds for better detection")
+    
+    video_path = input("Enter video file name: ")
+    video_path = os.path.join(os.getcwd(), "videos", video_path)
+    
+    if not os.path.exists(video_path):
+        print(f"Error: Video file not found at {video_path}")
+        return
+    
+    save_output = input("Save output video? (y/n): ").lower() == 'y'
+    
+    if save_output:
+        output_path = input("Enter output file path (e.g., improved_squat.mp4): ")
+        analyzer.process_video(video_path, output_path)
+    else:
+        analyzer.process_video(video_path)
+
+
+if __name__ == "__main__":
+    main()
