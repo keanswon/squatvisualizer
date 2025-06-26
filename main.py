@@ -35,6 +35,10 @@ class ImprovedSquatAnalyzer:
         # Frame counter for debugging
         self.frame_count = 0
         self.detection_count = 0
+        
+        # Squat depth thresholds (knee angles)
+        self.DEPTH_THRESHOLD = 90  # Knee angle threshold for "depth reached"
+        self.SHALLOW_THRESHOLD = 120  # Above this is considered shallow
 
     def smooth_landmarks(self, landmarks):
         """Apply gentle temporal smoothing to reduce jitter"""
@@ -165,11 +169,13 @@ class ImprovedSquatAnalyzer:
         return image
 
     def calculate_angle(self, p1, p2, p3):
-        """Calculate angle between three points"""
+        """Calculate angle between three points (p2 is the vertex)"""
         try:
+            # Create vectors from the vertex point (p2) to the other two points
             a = np.array([p1[0] - p2[0], p1[1] - p2[1]])
             b = np.array([p3[0] - p2[0], p3[1] - p2[1]])
             
+            # Calculate the angle using dot product
             cosine_angle = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
             angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
             return np.degrees(angle)
@@ -177,7 +183,7 @@ class ImprovedSquatAnalyzer:
             return 0
 
     def analyze_squat_form(self, landmarks):
-        """Comprehensive squat form analysis with lower thresholds"""
+        """Improved squat form analysis focusing on knee angles"""
         if not landmarks:
             return {}
         
@@ -204,40 +210,11 @@ class ImprovedSquatAnalyzer:
             analysis['form_issues'] = ['Insufficient landmark detection']
             return analysis
         
-        # 1. Squat Depth (if hips, knees, ankles are visible)
-        if (left_hip.visibility > min_visibility and right_hip.visibility > min_visibility and
-            left_knee.visibility > min_visibility and right_knee.visibility > min_visibility and
-            left_ankle.visibility > min_visibility and right_ankle.visibility > min_visibility):
-            
-            hip_y = (left_hip.y + right_hip.y) / 2
-            knee_y = (left_knee.y + right_knee.y) / 2
-            ankle_y = (left_ankle.y + right_ankle.y) / 2
-            
-            # Calculate depth based on hip-knee relationship
-            if hip_y < knee_y:  # Hips above knees (standing position)
-                squat_depth = 0
-            else:
-                # Calculate actual squat depth
-                hip_knee_diff = hip_y - knee_y  # How much hips dropped below knees
-                
-                # Use a more reliable reference for depth calculation
-                # Calculate the distance from hip to ankle as leg length
-                avg_hip_y = (left_hip.y + right_hip.y) / 2
-                avg_ankle_y = (left_ankle.y + right_ankle.y) / 2
-                leg_length = avg_ankle_y - avg_hip_y
-                
-                if leg_length > 0:
-                    # Normalize the depth as a percentage of leg length
-                    depth_ratio = hip_knee_diff / leg_length
-                    squat_depth = min(100, max(0, depth_ratio * 200))  # Scale factor adjusted
-                else:
-                    squat_depth = 0
-
-            
-            analysis['squat_depth'] = squat_depth
-        
-        # 2. Knee Angles
+        # Calculate knee angles (this is the key metric for squat depth)
         knee_angles = []
+        individual_angles = {}
+        
+        # Left knee angle
         if (left_hip.visibility > min_visibility and left_knee.visibility > min_visibility and 
             left_ankle.visibility > min_visibility):
             left_knee_angle = self.calculate_angle(
@@ -247,7 +224,9 @@ class ImprovedSquatAnalyzer:
             )
             if left_knee_angle > 0:
                 knee_angles.append(left_knee_angle)
+                individual_angles['left'] = left_knee_angle
         
+        # Right knee angle
         if (right_hip.visibility > min_visibility and right_knee.visibility > min_visibility and 
             right_ankle.visibility > min_visibility):
             right_knee_angle = self.calculate_angle(
@@ -257,33 +236,40 @@ class ImprovedSquatAnalyzer:
             )
             if right_knee_angle > 0:
                 knee_angles.append(right_knee_angle)
+                individual_angles['right'] = right_knee_angle
         
+        # Store knee angle information
         if knee_angles:
             analysis['knee_angle'] = sum(knee_angles) / len(knee_angles)
+            analysis['individual_knee_angles'] = individual_angles
         
-        # 3. Form Assessment
+        # Depth assessment based on knee angles
         analysis['form_issues'] = []
         
-        # Check squat depth
-        if 'squat_depth' in analysis:
-            depth = analysis['squat_depth']
-            if depth < 30:
-                analysis['form_issues'].append("Shallow squat - go deeper")
-            elif depth > 90:
-                analysis['form_issues'].append("Very deep squat")
-        
-        # Check knee angle
         if 'knee_angle' in analysis:
-            angle = analysis['knee_angle']
-            if angle < 60:
-                analysis['form_issues'].append("Knees very bent")
-            elif angle > 170:
-                analysis['form_issues'].append("Knees not bent enough")
+            avg_knee_angle = analysis['knee_angle']
+            
+            # Assess squat depth based on knee angle
+            if avg_knee_angle > self.SHALLOW_THRESHOLD:
+                analysis['depth_status'] = 'Not deep enough'
+                analysis['form_issues'].append('Not deep enough - squat deeper')
+            elif avg_knee_angle <= self.DEPTH_THRESHOLD:
+                analysis['depth_status'] = 'Depth reached'
+                # No issue - good depth
+            else:  # Between DEPTH_THRESHOLD and SHALLOW_THRESHOLD
+                analysis['depth_status'] = 'Approaching depth'
+                analysis['form_issues'].append('Almost there - go a bit deeper')
+        
+        # Check for knee angle imbalance
+        if len(individual_angles) == 2:
+            angle_diff = abs(individual_angles['left'] - individual_angles['right'])
+            if angle_diff > 15:  # More than 15 degrees difference
+                analysis['form_issues'].append(f'Uneven knee angles (diff: {angle_diff:.1f}°)')
         
         return analysis
 
     def draw_form_feedback(self, image, analysis):
-        """Draw form analysis on the image"""
+        """Draw form analysis on the image with improved depth feedback"""
         h, w, _ = image.shape
         y_offset = 30
         
@@ -295,36 +281,57 @@ class ImprovedSquatAnalyzer:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         y_offset += 30
         
-        # Squat depth
-        if 'squat_depth' in analysis:
-            depth = analysis['squat_depth']
-            color = (0, 255, 0) if 40 <= depth <= 80 else (0, 255, 255)
-            cv2.putText(image, f'Depth: {depth:.1f}%', (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            y_offset += 30
-        
-        # Knee angle
+        # Knee angle and depth status
         if 'knee_angle' in analysis:
             angle = analysis['knee_angle']
-            color = (0, 255, 0) if 90 <= angle <= 150 else (0, 255, 255)
-            cv2.putText(image, f'Knee Angle: {angle:.1f}°', (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            y_offset += 30
-        
-        # Form issues
-        if analysis.get('form_issues'):
-            cv2.putText(image, 'Issues:', (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            y_offset += 25
+            depth_status = analysis.get('depth_status', 'Unknown')
             
-            for issue in analysis['form_issues'][:2]:  # Show max 2 issues
-                cv2.putText(image, f'• {issue}', (15, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
-                y_offset += 20
-        else:
-            if analysis.get('detection_quality') == 'Good':
-                cv2.putText(image, 'Form looks good!', (10, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Color coding for depth status
+            if depth_status == 'Depth reached':
+                color = (0, 255, 0)  # Green
+            elif depth_status == 'Not deep enough':
+                color = (0, 0, 255)  # Red
+            elif depth_status == 'Approaching depth':
+                color = (0, 255, 255)  # Yellow
+            else:
+                color = (255, 255, 255)  # White
+            
+            cv2.putText(image, f'Knee Angle: {angle:.1f}°', (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            y_offset += 30
+            
+            # Large, prominent depth status
+            cv2.putText(image, f'{depth_status.upper()}', (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+            y_offset += 40
+            
+            # Show individual knee angles if available
+            if 'individual_knee_angles' in analysis:
+                angles = analysis['individual_knee_angles']
+                angle_text = f"L: {angles.get('left', 0):.1f}° R: {angles.get('right', 0):.1f}°"
+                cv2.putText(image, angle_text, (10, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                y_offset += 25
+        
+        # ignore form issues for now
+        # # Form issues
+        # if analysis.get('form_issues'):
+        #     cv2.putText(image, 'Issues:', (10, y_offset), 
+        #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        #     y_offset += 25
+            
+        #     for issue in analysis['form_issues'][:2]:  # Show max 2 issues
+        #         cv2.putText(image, f'• {issue}', (15, y_offset), 
+        #                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+        #         y_offset += 20
+        # else:
+        #     if analysis.get('detection_quality') == 'Good' and analysis.get('depth_status') == 'Depth reached':
+        #         cv2.putText(image, 'Great form!', (10, y_offset), 
+        #                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Depth threshold reference
+        cv2.putText(image, f'Target: <{self.DEPTH_THRESHOLD}° for depth', 
+                   (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
         # Debug info
         cv2.putText(image, f'Frame: {self.frame_count} | Detections: {self.detection_count}', 
@@ -367,6 +374,7 @@ class ImprovedSquatAnalyzer:
         print(f"========================")
         
         print(f"Video info: {width}x{height}, {fps} FPS, {total_frames} frames")
+        print(f"Squat depth thresholds: Depth at <{self.DEPTH_THRESHOLD}°, Shallow at >{self.SHALLOW_THRESHOLD}°")
         
         # If you want to force the output to maintain the input orientation:
         if output_path:
@@ -414,7 +422,7 @@ class ImprovedSquatAnalyzer:
             
             cv2.imshow('Improved Squat Analysis', frame)
             
-            if out:
+            if output_path:
                 out.write(frame)
             
             # Progress indicator
@@ -426,7 +434,7 @@ class ImprovedSquatAnalyzer:
                 break
         
         cap.release()
-        if out:
+        if output_path:
             out.release()
         cv2.destroyAllWindows()
         
@@ -440,7 +448,8 @@ def main():
     analyzer = ImprovedSquatAnalyzer()
     
     print("Improved MediaPipe Squat Analyzer")
-    print("This version uses lower confidence thresholds for better detection")
+    print("This version focuses on knee angles for accurate depth assessment")
+    print(f"Depth thresholds: <{analyzer.DEPTH_THRESHOLD}° = depth reached, >{analyzer.SHALLOW_THRESHOLD}° = not deep enough")
     
     video_path = input("Enter video file name: ")
     video_path = os.path.join(os.getcwd(), "videos", video_path)
