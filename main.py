@@ -339,6 +339,297 @@ class ImprovedSquatAnalyzer:
         
         return image
     
+    def analyze_back_posture(self, landmarks):
+        """
+        Modified back analysis that focuses on spinal flexion (rounding) rather than forward lean.
+        Forward lean is normal and expected in squats, especially low-bar squats.
+        """
+        if not landmarks:
+            return {}
+        
+        min_visibility = 0.3
+        back_analysis = {}
+        
+        # Get spine-related landmarks
+        left_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_HIP]
+        
+        # Try to get head/neck landmarks for better curvature analysis
+        nose = landmarks.landmark[self.mp_pose.PoseLandmark.NOSE]
+        
+        # Check if we have enough landmarks for back analysis
+        spine_landmarks = [left_shoulder, right_shoulder, left_hip, right_hip]
+        visible_spine_count = sum(1 for lm in spine_landmarks if lm.visibility > min_visibility)
+        
+        back_analysis['spine_landmarks_visible'] = visible_spine_count
+        
+        if visible_spine_count < 3:
+            back_analysis['back_analysis_available'] = False
+            back_analysis['back_status'] = 'Insufficient data'
+            return back_analysis
+        
+        back_analysis['back_analysis_available'] = True
+        
+        try:
+            # Calculate spine alignment using shoulder and hip centers
+            if (left_shoulder.visibility > min_visibility and right_shoulder.visibility > min_visibility and
+                left_hip.visibility > min_visibility and right_hip.visibility > min_visibility):
+                
+                # Calculate center points
+                shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
+                shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
+                hip_center_x = (left_hip.x + right_hip.x) / 2
+                hip_center_y = (left_hip.y + right_hip.y) / 2
+                
+                # Store the basic spine vector for reference
+                spine_vector_x = shoulder_center_x - hip_center_x
+                spine_vector_y = shoulder_center_y - hip_center_y
+                
+                # Method 1: MAIN ANALYSIS - Spinal curvature using head position
+                if nose.visibility > min_visibility:
+                    # Three-point analysis: head → shoulders → hips
+                    upper_point = (nose.x, nose.y)
+                    mid_point = (shoulder_center_x, shoulder_center_y)
+                    lower_point = (hip_center_x, hip_center_y)
+                    
+                    # Calculate actual spinal curvature (flexion)
+                    curvature_deviation = self.calculate_spine_curvature(upper_point, mid_point, lower_point)
+                    back_analysis['spine_curvature'] = curvature_deviation
+                    
+                    # More conservative thresholds - only flag obvious rounding
+                    if curvature_deviation > 0.12:  # Higher threshold - only severe rounding
+                        back_analysis['back_status'] = 'Significant back rounding'
+                        back_analysis['back_issue'] = True
+                    elif curvature_deviation > 0.08:  # Moderate threshold
+                        back_analysis['back_status'] = 'Mild back rounding'
+                        back_analysis['back_issue'] = True
+                    else:
+                        back_analysis['back_status'] = 'Spine neutral'
+                        back_analysis['back_issue'] = False
+                        
+                    # Additional context: Calculate the expected vs actual head position
+                    # In a neutral spine, head should be roughly in line with the spine angle
+                    expected_head_x = shoulder_center_x + (shoulder_center_x - hip_center_x) * 0.3
+                    actual_head_deviation = abs(nose.x - expected_head_x)
+                    back_analysis['head_position_deviation'] = actual_head_deviation
+                    
+                    # Only flag if head is significantly forward AND we have curvature
+                    if actual_head_deviation > 0.08 and curvature_deviation > 0.06:
+                        if not back_analysis.get('back_issue', False):
+                            back_analysis['back_status'] = 'Head forward posture'
+                            back_analysis['back_issue'] = True
+                
+                else:
+                    # Fallback method when head is not visible - shoulder position analysis
+                    # Look for shoulder protraction (rounding forward of shoulders)
+                    
+                    # Calculate shoulder width and compare to hip width
+                    shoulder_width = abs(left_shoulder.x - right_shoulder.x)
+                    hip_width = abs(left_hip.x - right_hip.x)
+                    
+                    # In rounded posture, shoulders often appear narrower due to protraction
+                    width_ratio = shoulder_width / hip_width if hip_width > 0 else 1.0
+                    back_analysis['shoulder_width_ratio'] = width_ratio
+                    
+                    # Conservative threshold - only flag obvious shoulder protraction
+                    if width_ratio < 0.85:  # Shoulders significantly narrower than hips
+                        back_analysis['back_status'] = 'Possible shoulder protraction'
+                        back_analysis['back_issue'] = True
+                    else:
+                        back_analysis['back_status'] = 'Shoulder position OK'
+                        back_analysis['back_issue'] = False
+                
+                # Method 2: Shoulder asymmetry (can indicate compensation)
+                shoulder_angle = np.degrees(np.arctan2(
+                    right_shoulder.y - left_shoulder.y,
+                    right_shoulder.x - left_shoulder.x
+                ))
+                back_analysis['shoulder_angle'] = abs(shoulder_angle)
+                
+                # Only flag significant asymmetry (more conservative)
+                if abs(shoulder_angle) > 12:  # Increased threshold
+                    back_analysis['shoulder_asymmetry'] = True
+                    # Don't automatically mark as issue unless it's extreme
+                    if abs(shoulder_angle) > 20:
+                        back_analysis['asymmetry_severe'] = True
+                else:
+                    back_analysis['shoulder_asymmetry'] = False
+            
+            # Overall back assessment - more conservative
+            if 'back_issue' not in back_analysis:
+                back_analysis['back_issue'] = False
+                back_analysis['back_status'] = 'Spine neutral'
+        
+        except Exception as e:
+            back_analysis['back_analysis_error'] = str(e)
+            back_analysis['back_status'] = 'Analysis error'
+        
+        return back_analysis
+
+    def calculate_spine_curvature(self, upper_point, mid_point, lower_point):
+        """
+        Calculate spinal curvature focusing on flexion rather than normal postural angles.
+        This version is more specific to detecting actual rounding vs normal squat posture.
+        """
+        try:
+            # Convert to numpy arrays
+            p1 = np.array(upper_point)    # Head/nose
+            p2 = np.array(mid_point)      # Shoulder center
+            p3 = np.array(lower_point)    # Hip center
+            
+            # Calculate the direct line from head to hips
+            head_to_hip_vector = p3 - p1
+            head_to_hip_length = np.linalg.norm(head_to_hip_vector)
+            
+            if head_to_hip_length == 0:
+                return 0
+            
+            # Vector from head to shoulders
+            head_to_shoulder = p2 - p1
+            
+            # Project shoulder position onto the head-hip line
+            projection_length = np.dot(head_to_shoulder, head_to_hip_vector) / head_to_hip_length
+            projection_point = p1 + (projection_length / head_to_hip_length) * head_to_hip_vector
+            
+            # Distance from actual shoulder position to the straight head-hip line
+            deviation = np.linalg.norm(p2 - projection_point)
+            
+            # Normalize by the head-hip distance
+            normalized_deviation = deviation / head_to_hip_length
+            
+            # Additional check: determine if this is forward deviation (rounding)
+            # vs backward deviation (over-extension)
+            cross_product = np.cross(head_to_hip_vector[:2], head_to_shoulder[:2])
+            
+            # Only return positive values for forward deviation (actual rounding)
+            if cross_product > 0:  # Shoulder is forward of the line (rounding)
+                return normalized_deviation
+            else:  # Shoulder is behind the line (extension/neutral)
+                return normalized_deviation * 0.5  # Reduce the penalty for extension
+        
+        except:
+            return 0
+
+    def draw_back_analysis_feedback(self, image, back_analysis, y_start_offset=200):
+        """
+        Modified feedback display focusing on actual spinal issues rather than normal squat posture.
+        """
+        if not back_analysis.get('back_analysis_available', False):
+            return image, y_start_offset
+        
+        h, w, _ = image.shape
+        y_offset = y_start_offset
+        
+        # Back posture status
+        back_status = back_analysis.get('back_status', 'Unknown')
+        back_issue = back_analysis.get('back_issue', False)
+        
+        # Color coding - more nuanced
+        if back_issue and 'Significant' in back_status:
+            color = (0, 0, 255)  # Red for significant issues
+            status_prefix = "⚠ "
+        elif back_issue:
+            color = (0, 165, 255)  # Orange for mild issues
+            status_prefix = "⚠ "
+        else:
+            color = (0, 255, 0)  # Green for good posture
+            status_prefix = "✓ "
+        
+        cv2.putText(image, f'{status_prefix}Spine: {back_status}', (10, y_offset), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        y_offset += 25
+        
+        # Show curvature metric if available (for debugging/fine-tuning)
+        if 'spine_curvature' in back_analysis:
+            curvature = back_analysis['spine_curvature']
+            # Only show if there's some curvature detected
+            if curvature > 0.03:
+                cv2.putText(image, f'Curvature: {curvature:.3f}', (15, y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                y_offset += 20
+        
+        # Show shoulder width ratio if head not visible
+        if 'shoulder_width_ratio' in back_analysis:
+            ratio = back_analysis['shoulder_width_ratio']
+            cv2.putText(image, f'Shoulder ratio: {ratio:.2f}', (15, y_offset), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            y_offset += 20
+        
+        # Only show asymmetry if it's severe
+        if back_analysis.get('asymmetry_severe', False):
+            cv2.putText(image, '• Severe shoulder asymmetry', (15, y_offset), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            y_offset += 20
+        
+        return image, y_offset
+
+    def draw_spine_visualization(self, image, landmarks, back_analysis):
+        """
+        Enhanced spine visualization that shows normal squat posture vs rounding.
+        Forward lean is shown as normal (yellow/green) while rounding is red.
+        """
+        if not landmarks or not back_analysis.get('back_analysis_available', False):
+            return image
+        
+        h, w, _ = image.shape
+        min_visibility = 0.3
+        
+        # Get landmarks
+        left_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_HIP]
+        nose = landmarks.landmark[self.mp_pose.PoseLandmark.NOSE]
+        
+        if (left_shoulder.visibility > min_visibility and right_shoulder.visibility > min_visibility and
+            left_hip.visibility > min_visibility and right_hip.visibility > min_visibility):
+            
+            # Calculate centers
+            shoulder_center_x = int((left_shoulder.x + right_shoulder.x) * w / 2)
+            shoulder_center_y = int((left_shoulder.y + right_shoulder.y) * h / 2)
+            hip_center_x = int((left_hip.x + right_hip.x) * w / 2)
+            hip_center_y = int((left_hip.y + right_hip.y) * h / 2)
+            
+            # Color spine based on actual rounding, not forward lean
+            back_issue = back_analysis.get('back_issue', False)
+            spine_curvature = back_analysis.get('spine_curvature', 0)
+            
+            # Color logic: Green/yellow for normal forward lean, red only for actual rounding
+            if back_issue and spine_curvature > 0.08:
+                spine_color = (0, 0, 255)  # Red for actual rounding
+                thickness = 4
+            else:
+                spine_color = (0, 255, 255)  # Yellow for normal posture (even with forward lean)
+                thickness = 3
+            
+            # Draw spine line
+            cv2.line(image, (shoulder_center_x, shoulder_center_y), 
+                    (hip_center_x, hip_center_y), spine_color, thickness)
+            
+            # If head is visible and we're analyzing curvature
+            if nose.visibility > min_visibility and 'spine_curvature' in back_analysis:
+                nose_x = int(nose.x * w)
+                nose_y = int(nose.y * h)
+                
+                # Draw head-to-shoulder line
+                cv2.line(image, (nose_x, nose_y), (shoulder_center_x, shoulder_center_y), spine_color, 2)
+                
+                # Add annotation for significant curvature
+                if spine_curvature > 0.08:
+                    cv2.putText(image, f'Rounding: {spine_curvature:.3f}', 
+                            (shoulder_center_x + 10, shoulder_center_y - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, spine_color, 1)
+            
+            # Add a small indicator for "normal forward lean"
+            if not back_issue:
+                cv2.putText(image, 'Normal lean', 
+                        (shoulder_center_x + 10, shoulder_center_y + 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        return image
+    
     def process_video(self, video_path, output_path=None):
         """Process video with improved analysis"""
         cap = cv2.VideoCapture(video_path)
@@ -410,9 +701,17 @@ class ImprovedSquatAnalyzer:
                 
                 # Analyze form
                 analysis = self.analyze_squat_form(smoothed_landmarks)
+
+                # Add back posture analysis
+                back_analysis = self.analyze_back_posture(smoothed_landmarks)
+
+                # Draw spine visualization
+                frame = self.draw_spine_visualization(frame, smoothed_landmarks, back_analysis)
                 
-                # Draw feedback
+                # Draw feedback (including back analysis)
                 frame = self.draw_form_feedback(frame, analysis)
+                frame, _ = self.draw_back_analysis_feedback(frame, back_analysis)
+
             else:
                 # No detection
                 cv2.putText(frame, 'No pose detected', (10, 30), 
