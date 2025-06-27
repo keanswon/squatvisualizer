@@ -16,7 +16,7 @@ def get_pose_detector():
             model_complexity=1,  # Reduced complexity for better performance
             enable_segmentation=False,
             min_detection_confidence=0.5,  # Lower threshold for better detection
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.65
         )
     return _pose_detector
 
@@ -31,6 +31,15 @@ class ImprovedSquatAnalyzer:
         self.prev_landmarks = None
         self.landmark_history = []
         self.max_history = 3  # Reduced history for less lag
+
+        # Knee angle smoothing
+        self.knee_angle_history = []
+        self.knee_angle_history_size = 8  # Smooth over 8 frames for stability
+        self.smoothed_knee_angle = None
+
+        self.depth_history = []
+        self.depth_history_size = 5  # Number of frames to consider for smoothing
+        self.current_depth_status = "Unknown"
         
         # Frame counter for debugging
         self.frame_count = 0
@@ -67,6 +76,26 @@ class ImprovedSquatAnalyzer:
                                                0.3 * prev_landmarks.landmark[i].y)
         
         return landmarks
+    
+    def smooth_knee_angle(self, new_angle):
+        """Apply more aggressive smoothing to knee angle to reduce jitter"""
+        if new_angle is None:
+            return self.smoothed_knee_angle
+        
+        # Add current angle to history
+        self.knee_angle_history.append(new_angle)
+        if len(self.knee_angle_history) > self.knee_angle_history_size:
+            self.knee_angle_history.pop(0)
+        
+        # Use exponential moving average for smoother results
+        if self.smoothed_knee_angle is None:
+            self.smoothed_knee_angle = new_angle
+        else:
+            # More aggressive smoothing - only 20% new data, 80% previous
+            alpha = 0.2  # Lower = smoother but less responsive
+            self.smoothed_knee_angle = alpha * new_angle + (1 - alpha) * self.smoothed_knee_angle
+        
+        return self.smoothed_knee_angle
 
     def filter_reliable_landmarks(self, landmarks, threshold=0.3):
         """Only use landmarks with reasonable confidence - lowered threshold"""
@@ -75,6 +104,45 @@ class ImprovedSquatAnalyzer:
             if landmark.visibility > threshold:
                 reliable_indices.append(i)
         return reliable_indices
+    
+    def smooth_depth_status(self, new_knee_angle):
+        """Smooth depth status transitions to reduce text jumping"""
+        if new_knee_angle is None:
+            return self.current_depth_status
+        
+        # Add current angle to history
+        self.depth_history.append(new_knee_angle)
+        if len(self.depth_history) > self.depth_history_size:
+            self.depth_history.pop(0)
+        
+        # Need at least 3 frames for smoothing
+        if len(self.depth_history) < 3:
+            return self.current_depth_status
+        
+        # Calculate average angle over recent frames
+        avg_angle = sum(self.depth_history) / len(self.depth_history)
+        
+        # Determine status based on smoothed angle
+        if avg_angle > self.DEPTH_THRESHOLD:
+            new_status = 'Not deep enough'
+        else:
+            new_status = 'Depth reached'
+        
+        # Only change status if we have strong evidence (at least 3 consecutive frames suggesting change)
+        recent_angles = self.depth_history[-3:]
+        consistent_direction = True
+        
+        if self.current_depth_status != new_status:
+            # Check if recent trend supports the change
+            if new_status == 'Depth reached':
+                consistent_direction = all(angle <= self.DEPTH_THRESHOLD + 5 for angle in recent_angles)
+            else:
+                consistent_direction = all(angle >= self.SHALLOW_THRESHOLD - 5 for angle in recent_angles)
+            
+            if consistent_direction:
+                self.current_depth_status = new_status
+        
+        return self.current_depth_status
 
     def draw_clean_stick_figure(self, image, landmarks):
         """Draw a cleaner stick figure focusing on reliable points"""
@@ -239,26 +307,35 @@ class ImprovedSquatAnalyzer:
                 individual_angles['right'] = right_knee_angle
         
         # Store knee angle information
+        # Store knee angle information with smoothing
         if knee_angles:
-            analysis['knee_angle'] = sum(knee_angles) / len(knee_angles)
+            raw_angle = sum(knee_angles) / len(knee_angles)
+            smoothed_angle = self.smooth_knee_angle(raw_angle)
+            analysis['knee_angle'] = smoothed_angle
+            analysis['raw_knee_angle'] = raw_angle  # Keep raw for debugging
             analysis['individual_knee_angles'] = individual_angles
+        else:
+            # No angle detected, use previous smoothed value
+            analysis['knee_angle'] = self.smooth_knee_angle(None)
         
         # Depth assessment based on knee angles
+        # Depth assessment based on knee angles with smoothing
         analysis['form_issues'] = []
-        
+
         if 'knee_angle' in analysis:
             avg_knee_angle = analysis['knee_angle']
             
-            # Assess squat depth based on knee angle
-            if avg_knee_angle > self.SHALLOW_THRESHOLD:
-                analysis['depth_status'] = 'Not deep enough'
+            # Get smoothed depth status
+            analysis['depth_status'] = self.smooth_depth_status(avg_knee_angle)
+            
+            # Add form issues based on smoothed status
+            if analysis['depth_status'] == 'Not deep enough':
                 analysis['form_issues'].append('Not deep enough - squat deeper')
-            elif avg_knee_angle <= self.DEPTH_THRESHOLD:
-                analysis['depth_status'] = 'Depth reached'
-                # No issue - good depth
-            else:  # Between DEPTH_THRESHOLD and SHALLOW_THRESHOLD
-                analysis['depth_status'] = 'Approaching depth'
-                analysis['form_issues'].append('Almost there - go a bit deeper')
+
+            # No issue added for 'Depth reached'
+        else:
+            # No knee angle available, use previous status
+            analysis['depth_status'] = self.smooth_depth_status(None)
         
         # Check for knee angle imbalance
         if len(individual_angles) == 2:
@@ -271,7 +348,7 @@ class ImprovedSquatAnalyzer:
     def draw_form_feedback(self, image, analysis):
         """Draw form analysis on the image with improved depth feedback"""
         h, w, _ = image.shape
-        y_offset = 30
+        y_offset = 35
         
         # Detection quality
         quality = analysis.get('detection_quality', 'Unknown')
@@ -279,7 +356,7 @@ class ImprovedSquatAnalyzer:
         color = (0, 255, 0) if quality == 'Good' else (0, 165, 255) if quality == 'Fair' else (0, 0, 255)
         cv2.putText(image, f'Detection: {quality} ({visible}/6)', (10, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        y_offset += 30
+        y_offset += 35
         
         # Knee angle and depth status
         if 'knee_angle' in analysis:
@@ -291,27 +368,25 @@ class ImprovedSquatAnalyzer:
                 color = (0, 255, 0)  # Green
             elif depth_status == 'Not deep enough':
                 color = (0, 0, 255)  # Red
-            elif depth_status == 'Approaching depth':
-                color = (0, 255, 255)  # Yellow
             else:
                 color = (255, 255, 255)  # White
             
-            cv2.putText(image, f'Knee Angle: {angle:.1f}°', (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            y_offset += 30
+            cv2.putText(image, f'Knee Angle: {int(round(angle))}°', (10, y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            y_offset += 35
             
             # Large, prominent depth status
             cv2.putText(image, f'{depth_status.upper()}', (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-            y_offset += 40
+            y_offset += 45
             
             # Show individual knee angles if available
             if 'individual_knee_angles' in analysis:
                 angles = analysis['individual_knee_angles']
-                angle_text = f"L: {angles.get('left', 0):.1f}° R: {angles.get('right', 0):.1f}°"
+                angle_text = f"L: {int(round(angles.get('left', 0)))}° R: {int(round(angles.get('right', 0)))}°"
                 cv2.putText(image, angle_text, (10, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-                y_offset += 25
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)  # White and thicker
+                y_offset += 40
         
         # ignore form issues for now
         # # Form issues
@@ -440,22 +515,6 @@ class ImprovedSquatAnalyzer:
                     else:
                         back_analysis['back_status'] = 'Shoulder position OK'
                         back_analysis['back_issue'] = False
-                
-                # Method 2: Shoulder asymmetry (can indicate compensation)
-                shoulder_angle = np.degrees(np.arctan2(
-                    right_shoulder.y - left_shoulder.y,
-                    right_shoulder.x - left_shoulder.x
-                ))
-                back_analysis['shoulder_angle'] = abs(shoulder_angle)
-                
-                # Only flag significant asymmetry (more conservative)
-                if abs(shoulder_angle) > 12:  # Increased threshold
-                    back_analysis['shoulder_asymmetry'] = True
-                    # Don't automatically mark as issue unless it's extreme
-                    if abs(shoulder_angle) > 20:
-                        back_analysis['asymmetry_severe'] = True
-                else:
-                    back_analysis['shoulder_asymmetry'] = False
             
             # Overall back assessment - more conservative
             if 'back_issue' not in back_analysis:
@@ -539,7 +598,7 @@ class ImprovedSquatAnalyzer:
         
         cv2.putText(image, f'{status_prefix}Spine: {back_status}', (10, y_offset), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        y_offset += 25
+        y_offset += 30
         
         # Show curvature metric if available (for debugging/fine-tuning)
         if 'spine_curvature' in back_analysis:
@@ -548,20 +607,20 @@ class ImprovedSquatAnalyzer:
             if curvature > 0.03:
                 cv2.putText(image, f'Curvature: {curvature:.3f}', (15, y_offset), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                y_offset += 20
+                y_offset += 25
         
         # Show shoulder width ratio if head not visible
         if 'shoulder_width_ratio' in back_analysis:
             ratio = back_analysis['shoulder_width_ratio']
             cv2.putText(image, f'Shoulder ratio: {ratio:.2f}', (15, y_offset), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            y_offset += 20
+            y_offset += 25
         
         # Only show asymmetry if it's severe
         if back_analysis.get('asymmetry_severe', False):
             cv2.putText(image, '• Severe shoulder asymmetry', (15, y_offset), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            y_offset += 20
+            y_offset += 25
         
         return image, y_offset
 
